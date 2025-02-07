@@ -121,6 +121,7 @@ struct Metrics {
     delete_retries_counter: Counter<u64>,
     count_retries_counter: Counter<u64>,
     query_retries_counter: Counter<u64>,
+    get_retries_counter: Counter<u64>,
 }
 
 #[derive(Clone, Debug)]
@@ -147,10 +148,12 @@ impl Frontend {
         let delete_retries_counter = meter.u64_counter("delete_retries").build();
         let count_retries_counter = meter.u64_counter("count_retries").build();
         let query_retries_counter = meter.u64_counter("query_retries").build();
+        let get_retries_counter = meter.u64_counter("query_retries").build();
         let metrics = Arc::new(Metrics {
             delete_retries_counter,
             count_retries_counter,
             query_retries_counter,
+            get_retries_counter,
         });
         Frontend {
             allow_reset,
@@ -696,21 +699,10 @@ impl Frontend {
                 .collections_with_segments_provider
                 .collections_with_segments_cache
                 .clone();
-            let metrics = Arc::clone(&self.metrics);
-            let retries = Arc::clone(&retries);
             async move {
                 let res = self_clone.retryable_delete(request_clone).await;
                 match res {
-                    Ok(res) => {
-                        metrics.delete_retries_counter.add(
-                            retries.load(Ordering::Relaxed) as u64,
-                            &[KeyValue::new(
-                                "collection_id",
-                                request.collection_id.to_string(),
-                            )],
-                        );
-                        Ok(res)
-                    }
+                    Ok(res) => Ok(res),
                     Err(e) => {
                         if e.code() == ErrorCodes::NotFound {
                             tracing::info!(
@@ -718,24 +710,27 @@ impl Frontend {
                                 request.collection_id
                             );
                             cache_clone.remove(&request.collection_id).await;
-                        } else {
-                            metrics.delete_retries_counter.add(
-                                retries.load(Ordering::Relaxed) as u64,
-                                &[KeyValue::new(
-                                    "collection_id",
-                                    request.collection_id.to_string(),
-                                )],
-                            );
                         }
                         Err(e)
                     }
                 }
             }
         };
-        delete_to_retry
+        let res = delete_to_retry
             .retry(self.collections_with_segments_provider.get_retry_backoff())
             .when(|e| e.code() == ErrorCodes::NotFound)
-            .await
+            .notify(|_, _| {
+                retries.fetch_add(1, Ordering::Relaxed);
+            })
+            .await;
+        self.metrics.delete_retries_counter.add(
+            retries.load(Ordering::Relaxed) as u64,
+            &[KeyValue::new(
+                "collection_id",
+                request.collection_id.to_string(),
+            )],
+        );
+        res
     }
 
     pub async fn retryable_count(
@@ -770,21 +765,10 @@ impl Frontend {
                 .collections_with_segments_provider
                 .collections_with_segments_cache
                 .clone();
-            let metrics = Arc::clone(&self.metrics);
-            let retries = Arc::clone(&retries);
             async move {
                 let res = self_clone.retryable_count(request_clone).await;
                 match res {
-                    Ok(res) => {
-                        metrics.count_retries_counter.add(
-                            retries.load(Ordering::Relaxed) as u64,
-                            &[KeyValue::new(
-                                "collection_id",
-                                request.collection_id.to_string(),
-                            )],
-                        );
-                        Ok(res)
-                    }
+                    Ok(res) => Ok(res),
                     Err(e) => {
                         if e.code() == ErrorCodes::NotFound {
                             tracing::info!(
@@ -792,24 +776,27 @@ impl Frontend {
                                 request.collection_id
                             );
                             cache_clone.remove(&request.collection_id).await;
-                        } else {
-                            metrics.count_retries_counter.add(
-                                retries.load(Ordering::Relaxed) as u64,
-                                &[KeyValue::new(
-                                    "collection_id",
-                                    request.collection_id.to_string(),
-                                )],
-                            );
                         }
                         Err(e)
                     }
                 }
             }
         };
-        count_to_retry
+        let res = count_to_retry
             .retry(self.collections_with_segments_provider.get_retry_backoff())
             .when(|e| e.code() == ErrorCodes::NotFound)
-            .await
+            .notify(|_, _| {
+                retries.fetch_add(1, Ordering::Relaxed);
+            })
+            .await;
+        self.metrics.count_retries_counter.add(
+            retries.load(Ordering::Relaxed) as u64,
+            &[KeyValue::new(
+                "collection_id",
+                request.collection_id.to_string(),
+            )],
+        );
+        res
     }
 
     async fn retryable_get(&mut self, request: GetRequest) -> Result<GetResponse, QueryError> {
@@ -847,6 +834,7 @@ impl Frontend {
     }
 
     pub async fn get(&mut self, request: GetRequest) -> Result<GetResponse, QueryError> {
+        let retries = Arc::new(AtomicUsize::new(0));
         let get_to_retry = || {
             let mut self_clone = self.clone();
             let request_clone = request.clone();
@@ -871,10 +859,21 @@ impl Frontend {
                 }
             }
         };
-        get_to_retry
+        let res = get_to_retry
             .retry(self.collections_with_segments_provider.get_retry_backoff())
             .when(|e| e.code() == ErrorCodes::NotFound)
-            .await
+            .notify(|_, _| {
+                retries.fetch_add(1, Ordering::Relaxed);
+            })
+            .await;
+        self.metrics.get_retries_counter.add(
+            retries.load(Ordering::Relaxed) as u64,
+            &[KeyValue::new(
+                "collection_id",
+                request.collection_id.to_string(),
+            )],
+        );
+        res
     }
 
     async fn retryable_query(
@@ -949,7 +948,6 @@ impl Frontend {
                                 request.collection_id
                             );
                             cache_clone.remove(&request.collection_id).await;
-                            retries.fetch_add(1, Ordering::Relaxed);
                         } else {
                             metrics.query_retries_counter.add(
                                 retries.load(Ordering::Relaxed) as u64,
@@ -967,6 +965,9 @@ impl Frontend {
         query_to_retry
             .retry(self.collections_with_segments_provider.get_retry_backoff())
             .when(|e| e.code() == ErrorCodes::NotFound)
+            .notify(|_, _| {
+                retries.fetch_add(1, Ordering::Relaxed);
+            })
             .await
     }
 
